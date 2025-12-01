@@ -13,10 +13,21 @@ from videollava.model.builder import load_pretrained_model
 from videollava.model.language_model.llava_llama import LlavaLlamaForCausalLM
 from videollava.train.train import smart_tokenizer_and_embedding_resize
 import time
+import random 
 
+import numpy as np
+
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+set_seed(43)
 
 def split_list(lst, n):
     """Split a list into n (roughly) equal-sized chunks"""
@@ -63,10 +74,10 @@ def parse_args():
     parser.add_argument('--gt_file_question', default="videollava/eval/GPT_Zero_Shot_QA/MSVD_Zero_Shot_QA/test_q.json" ,help='Path to the ground truth file containing question.')
     parser.add_argument('--gt_file_answers', default="videollava/eval/GPT_Zero_Shot_QA/MSVD_Zero_Shot_QA/test_a.json",help='Path to the ground truth file containing answers.')
     parser.add_argument('--output_dir', default="videollava/eval/GPT_Zero_Shot_QA/Video-LLaVA-7B",help='Directory to save the model results JSON.')
-    parser.add_argument('--output_name', default="spatial_0.5_full", help='Name of the file for storing results JSON.')
+    parser.add_argument('--output_name', default="1_0", help='Name of the file for storing results JSON.')
     parser.add_argument("--num_chunks", type=int, default=1)
-    parser.add_argument("--chunk_idx", type=int, default=0)
     parser.add_argument("--num_images", type=int, default=8)
+    parser.add_argument("--chunk_idx", type=int, default=0)
     parser.add_argument("--device", type=str, required=False, default='cuda')
     parser.add_argument('--model_base', help='', default=None, type=str, required=False)
     parser.add_argument("--model_max_length", type=int, required=False, default=2048)
@@ -74,11 +85,10 @@ def parse_args():
     return parser.parse_args()
 
 def get_model_output(model, video_processor, tokenizer, video, qs, args):
-    num = args.num_images
     if model.config.mm_use_im_start_end:
-        qs = DEFAULT_VID_START_TOKEN + ''.join([DEFAULT_IMAGE_TOKEN]*num) + DEFAULT_VID_END_TOKEN + '\n' + qs
+        qs = DEFAULT_VID_START_TOKEN + ''.join([DEFAULT_IMAGE_TOKEN]*args.num_images) + DEFAULT_VID_END_TOKEN + '\n' + qs
     else:
-        qs = ''.join([DEFAULT_IMAGE_TOKEN]*num) + '\n' + qs
+        qs = ''.join([DEFAULT_IMAGE_TOKEN]*args.num_images) + '\n' + qs
 
     conv_mode = "llava_v1"
     args.conv_mode = conv_mode
@@ -96,7 +106,10 @@ def get_model_output(model, video_processor, tokenizer, video, qs, args):
     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
     keywords = [stop_str]
     stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-
+    # with torch.inference_mode():
+    #     tower = model.get_video_tower()
+    #     print(tower)
+        
     # with torch.inference_mode():
     with torch.no_grad():
         output_ids = model.generate(
@@ -117,7 +130,7 @@ def get_model_output(model, video_processor, tokenizer, video, qs, args):
     if outputs.endswith(stop_str):
         outputs = outputs[:-len(stop_str)]
     outputs = outputs.strip()
-    print(outputs)
+    # print(outputs)
     return outputs
 
 
@@ -133,30 +146,13 @@ def run_inference(args):
     # print(torch.cuda.device_count())
     tokenizer, model, processor, context_len = load_pretrained_model(args.model_path, args.model_base, model_name)
     
- 
-    # print(torch.cuda.is_available())
-    
-    # print(torch.cuda.device_count())
-    
-    # print(torch.cuda.get_device_name(0))
-    
-    # print(torch.cuda.current_device())
-    
-    # print(torch.cuda.get_device_properties(0))
 
-    
     model = model.to(args.device)
 
-    # Load both ground truth file containing questions and answers
-    # with open(args.gt_file_question) as file:
-    #     gt_questions = json.load(file)
-    # with open(args.gt_file_answers) as file:
-    #     gt_answers = json.load(file)
 
     gt_questions = json.load(open(args.gt_file_question, "r"))
     gt_questions = get_chunk(gt_questions, args.num_chunks, args.chunk_idx)
     gt_answers = json.load(open(args.gt_file_answers, "r"))
-    # gt_answers = get_chunk(gt_answers, args.num_chunks, args.chunk_idx)
 
     answers_file = os.path.join(args.output_dir, f"{args.output_name}.json")
     os.makedirs(args.output_dir, exist_ok=True)
@@ -172,41 +168,25 @@ def run_inference(args):
     video_formats = ['.mp4', '.avi', '.mov', '.mkv']
 
     # Iterate over each sample in the ground truth file
-    index = 0
-    time_count = 0
-    for sample in tqdm(gt_questions):
-        video_name = sample['video_name']
-        question = sample['question']
-        id = sample['question_id']
-        answer = gt_answers[index]['answer']
-        index += 1
+    index = 10
+    sample = gt_questions[index]
+    video_name = sample['video_name']
+    question = sample['question']
+    id = sample['question_id']
+    answer = gt_answers[index]['answer']
+    fmt = '.avi'
+    video_path = os.path.join(args.video_dir, f"{video_name}{fmt}")
+    
+    t0 = time.time()
+    output = get_model_output(model, processor['video'], tokenizer, video_path, question, args)
+    te = time.time()
 
-        sample_set = {'id': id, 'question': question, 'answer': answer}
-        
-        # Load the video file
-        for fmt in (video_formats):  # Added this line
-            temp_path = os.path.join(args.video_dir, f"{video_name}{fmt}")
-            if os.path.exists(temp_path):
-                video_path = temp_path
-                # try:
-                # Run inference on the video and add the output to the list
-                t_init = time.time()
-                output = get_model_output(model, processor['video'], tokenizer, video_path, question, args)
-                t_finish = time.time()
-                time_count += (t_finish-t_init)
-                sample_set['pred'] = output
-                output_list.append(sample_set)
-                # except Exception as e:
-                #     print(f"Error processing video file '{video_name}': {e}")
-                ans_file.write(json.dumps(sample_set) + "\n")
-                break
-    
-    
-    print("##################")
-    print("total time is: " + str(time_count))
-    print("##################")
-    
-    ans_file.close()
+    print("=========================")
+    print(output)
+    print("total = " + str(te-t0))
+    print("=========================")
+    # 1.91 2.07 3.21 1.85 1.85
+    # 1.88 2.10 3.20 
     # Save the output list to a JSON file
     # with open(os.path.join(args.output_dir, f"{args.output_name}.json"), 'w') as file:
     #     json.dump(output_list, file)

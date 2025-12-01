@@ -14,6 +14,28 @@ from transformers.utils import add_start_docstrings_to_model_forward, replace_re
 
 from .configuration_video import LanguageBindVideoConfig, CLIPVisionConfig, CLIPTextConfig
 
+def compression(vi):
+    init = vi[:1,:,:,:].view(1,-1)
+    curr = vi[:1,:,:,:].view(1,-1)
+    sub = vi[1:,:,:,:].view(7,-1)
+    weight = torch.ones(sub.shape)
+    init_weight = torch.ones(curr.shape) * 1e10
+    dumy = 1e-3
+    whole_tensor = torch.cat((init,sub),dim=0)  
+    for i in range(len(weight)):
+        target = sub[i:i+1]
+        weight[i:i+1] = torch.abs((target-curr) / (curr + dumy))
+        curr = target
+    target_frames = 4
+    _, indices = torch.topk(-weight, target_frames, dim=0)
+    indices = indices + 1
+    weight = torch.cat((init_weight,weight),dim=0)  
+    
+    mask = torch.zeros_like(weight, dtype=torch.int32)
+    mask.scatter_(0, indices, 1)
+    compressed = whole_tensor[mask==1].view(target_frames,-1)
+    compressed = compressed.view(-1,3,224,224)
+    return compressed
 
 
 class PatchDropout(nn.Module):
@@ -74,6 +96,7 @@ class CLIPEncoderLayer(nn.Module):
         self.add_time_attn = config.add_time_attn
         if self.add_time_attn:
             self.t = config.num_frames
+            # self.t = 4
             self.temporal_embedding = nn.Parameter(torch.zeros(1, config.num_frames, config.hidden_size))
             nn.init.normal_(self.temporal_embedding, std=config.hidden_size ** -0.5)
 
@@ -642,8 +665,17 @@ class CLIPVisionTransformer(nn.Module):
             # print(pixel_values.shape)
             B, _, _, _ = pixel_values.shape
             T = 1
+            
+        
         ###########################
+        # import time
+        # t1 = time.time()
+        # pixel_values = pixel_values.contiguous()
+        # pixel_values = compression(pixel_values)
+        
         hidden_states = self.embeddings(pixel_values)
+        # t2 = time.time()
+        # print(t2-t1)
         # print(B, T)
         hidden_states = self.patch_dropout(hidden_states, B, T)  ##############################################
 

@@ -12,7 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-
+import torch.nn.functional as F
 from abc import ABC, abstractmethod
 
 import torch
@@ -22,7 +22,7 @@ from .multimodal_encoder.builder import build_image_tower, build_video_tower
 from .multimodal_projector.builder import build_vision_projector
 
 from videollava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-
+import time
 
 class LlavaMetaModel:
 
@@ -137,13 +137,205 @@ class LlavaMetaForCausalLM(ABC):
     def encode_images(self, images):
         image_features = self.get_model().get_image_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
+      
         return image_features
 
-    def encode_videos(self, videos):  # [mini_b, c, t, h, w]
+    def diff_temporal_merging(self, video_features, tomerge_size):  # [1, 8, 257, 4096]
+        bsz, t, pn, hd = video_features.shape
+        diff_video_feature = video_features[:, 1:, :, :] - video_features[:, :-1, :, :]  # [1, 7, 257, 4096]
+        diff = torch.mean(torch.abs(diff_video_feature), dim=-1)  # [1, 7, 257]
+        diff = torch.sum(diff, dim=-1) # [1, 7]
+        _, idx_tomerge = torch.topk(-diff, k=tomerge_size, dim=-1)
+        idx_tomerge, _ = torch.sort(idx_tomerge[0])
+
+        merge_mask = torch.zeros((t - tomerge_size, t), dtype=torch.bool)
+        last_idx = -2
+        row = -1
+        for idx in idx_tomerge:
+            if idx - last_idx == 1:
+                merge_mask[row][idx:idx + 2] = True
+            elif idx - last_idx == 2:
+                row += 1
+                merge_mask[row][idx:idx + 2] = True
+            else:
+                for i in range(last_idx + 2, idx):
+                    row += 1
+                    merge_mask[row, i] = True
+                row += 1
+                merge_mask[row][idx:idx + 2] = True
+            last_idx = idx
+        if row != (t - tomerge_size - 1):
+            for i in range(last_idx + 2, t):
+                row += 1
+                merge_mask[row, i] = True
+        # merge_mask: [t-tomerge_size, 8] 选出待merge的tokens
+        merge_mask = merge_mask.view(1, t - tomerge_size, t, 1, 1).repeat(bsz, 1, 1, pn, hd).to(video_features.device)
+        merged_video_features = (torch.sum(merge_mask * video_features.unsqueeze(1), dim=2)
+                                 / torch.sum(merge_mask, dim=2))
+
+        return merged_video_features
+
+    def sim_temporal_merging(self, video_features, tomerge_size):  # [1, 8, 257, 4096]
+        bsz, t, pn, hd = video_features.shape
+
+        norm = torch.norm(video_features, dim=-1).unsqueeze(-1)
+        video_features0 = video_features[:, :-1, :, :] / norm[:, :-1, :, :] # [1, 7, 257, 4096]
+        video_features1 = video_features[:, 1:, :, :] / norm[:, 1:, :, :]   # [1, 7, 257, 4096]
+        sim = (video_features0.unsqueeze(-2) @ video_features0.unsqueeze(-1))[..., 0, 0] # [1, 7, 257, 1, 1]
+        sim = torch.sum(sim, dim=2)
+        _, idx_tomerge = torch.topk(sim, k=tomerge_size, dim=-1)
+        idx_tomerge, _ = torch.sort(idx_tomerge[0])
+
+        merge_mask = torch.zeros((t - tomerge_size, t), dtype=torch.bool)
+        last_idx = -2
+        row = -1
+        for idx in idx_tomerge:
+            if idx - last_idx == 1:
+                merge_mask[row][idx:idx + 2] = True
+            elif idx - last_idx == 2:
+                row += 1
+                merge_mask[row][idx:idx + 2] = True
+            else:
+                for i in range(last_idx + 2, idx):
+                    row += 1
+                    merge_mask[row, i] = True
+                row += 1
+                merge_mask[row][idx:idx + 2] = True
+            last_idx = idx
+        if row != (t - tomerge_size - 1):
+            for i in range(last_idx + 2, t):
+                row += 1
+                merge_mask[row, i] = True
+        # merge_mask: [t-tomerge_size, 8] 选出待merge的tokens
+        merge_mask = merge_mask.view(1, t - tomerge_size, t, 1, 1).repeat(bsz, 1, 1, pn, hd).to(video_features.device)
+        merged_video_features = (torch.sum(merge_mask * video_features.unsqueeze(1), dim=2)
+                                 / torch.sum(merge_mask, dim=2))
+
+        return merged_video_features
+
+    def spatial_pruning(self, video_features, keep_ratio):
+        bsz, t, pn, hd = video_features.shape
+        keep_size = int(pn * keep_ratio)
+
+        norm = torch.norm(video_features, dim=-1).unsqueeze(-1)
+
+        cls = video_features[:, :, 0:1, :]  # [1, 7, 1, 4096]
+        tokens = video_features[:, :, 1:, :]  # [1, 7, 256, 4096]
+        sim = (tokens / norm[:, :, 1:, :]) @ (cls / norm[:, :, 0:1, :]).transpose(2, 3)  # [1, 7, 256, 1]
+        _, keep_topk = torch.topk(sim, k=keep_size - 1, dim=-2)
+        keep_topk = keep_topk.sort().values.repeat(bsz, 1, 1, hd)
+        mask = torch.zeros(tokens.shape, dtype=torch.bool).to(tokens.device)
+        mask = mask.scatter(-2, keep_topk, 1)
+        tokens = tokens[mask]
+        tokens = tokens.view(bsz, t, keep_size - 1, hd)
+        keep_video_feature = torch.cat((cls, tokens), dim=-2)
+
+        return keep_video_feature
+
+    def att_compr(self,A, B, K=0.6):
+        # 假设A和B是已经定义的张量
+        # A的尺寸: (1, 8, 257, 4096)
+        # B的尺寸: (54, 4096)
+        # K: 压缩比例 (0.2 表示压缩到原来的20%)
+
+        # 计算A和B的点积来衡量相似性
+        A_flattened = A.view(1, 8, 257, 1, 4096)  # (1, 8, 257, 1, 4096)
+        B_expanded = B.unsqueeze(0).unsqueeze(0).unsqueeze(2)  # (1, 1, 1, 54, 4096)
+        similarity = torch.sum(A_flattened * B_expanded, dim=-1)  # (1, 8, 257, 54)
+
+        # 计算注意力权重，使用Softmax进行归一化
+        attention_weights = F.softmax(similarity, dim=2)  # (1, 8, 257, 54)
+
+        # 计算注意力权重的均值，得到每个通道的整体注意力权重
+        average_attention = attention_weights.mean(dim=3)  # (1, 8, 257)
+
+        # 找到最相关的部分，根据K值选择前K%的部分
+        num_to_keep = int(A.size(2) * K)
+        _, indices = torch.topk(average_attention, num_to_keep, dim=2)  # (1, 8, num_to_keep)
+
+        # 使用选中的索引压缩A
+        indices = indices.unsqueeze(-1).expand(-1, -1, -1, A.size(-1))  # (1, 8, num_to_keep, 4096)
+        A_compressed = torch.gather(A, 2, indices)  # (1, 8, num_to_keep, 4096)
+
+        return A_compressed
+    
+    def cos_compr(self,A, B, K=0.6):
+        # A的尺寸: (1, 8, 257, 4096)
+        # B的尺寸: (54, 4096)
+        # K: 压缩比例 (0.2 表示压缩到原来的20%)
+
+        # 计算余弦相似度
+        A_flattened = A.view(1, 8, 257, 1, 4096)  # (1, 8, 257, 1, 4096)
+        B_expanded = B.unsqueeze(0).unsqueeze(0).unsqueeze(2)  # (1, 1, 1, 54, 4096)
+        cos_sim = F.cosine_similarity(A_flattened, B_expanded, dim=-1)  # (1, 8, 257, 54)
+
+        # 计算相似度的均值，得到每个通道的整体相似度
+        average_sim = cos_sim.mean(dim=3)  # (1, 8, 257)
+
+        # 找到最相关的部分，根据K值选择前K%的部分
+        num_to_keep = int(A.size(2) * K)
+        _, indices = torch.topk(average_sim, num_to_keep, dim=2)  # (1, 8, num_to_keep)
+
+        # 使用选中的索引压缩A
+        indices = indices.unsqueeze(-1).expand(-1, -1, -1, A.size(-1))  # (1, 8, num_to_keep, 4096)
+        A_compressed = torch.gather(A, 2, indices)  # (1, 8, num_to_keep, 4096)
+
+        return A_compressed
+    
+    def pool_compr(self,A, B, K=0.6):
+        # 假设A和B是已经定义的张量
+        # A的尺寸: (1, 8, 257, 4096)
+        # B的尺寸: (54, 4096)
+        # K: 压缩比例 (0.2 表示压缩到原来的20%)
+
+        # 计算A和B的相似度
+        A_flattened = A.view(1, 8, 257, 1, 4096)  # (1, 8, 257, 1, 4096)
+        B_expanded = B.unsqueeze(0).unsqueeze(0).unsqueeze(2)  # (1, 1, 1, 54, 4096)
+        similarity = torch.sum(A_flattened * B_expanded, dim=-1)  # (1, 8, 257, 54)
+
+        # 计算相似度的均值，得到每个通道的整体相似度
+        average_similarity = similarity.mean(dim=3)  # (1, 8, 257)
+
+        # 找到最相关的部分，根据K值选择前K%的部分
+        num_to_keep = int(A.size(2) * K)
+        _, indices = torch.topk(average_similarity, num_to_keep, dim=2)  # (1, 8, num_to_keep)
+
+        # 使用选中的索引对A进行池化操作
+        indices = indices.unsqueeze(-1).expand(-1, -1, -1, A.size(-1))  # (1, 8, num_to_keep, 4096)
+        A_pooled = torch.gather(A, 2, indices)  # (1, 8, num_to_keep, 4096)
+
+        return A_pooled
+    
+    
+        
+    def encode_videos(self, videos, num_images,text_embeds):  # [mini_b, c, t, h, w]
+        # [1,3,8,224,224]
+        # [1,8,257,1024]
+        # [1,8,257,4096]
         b, _, t, _, _ = videos.shape
+        
+        # t1 = time.time()
         video_features = self.get_model().get_video_tower()(videos)  # [mini_b, t, n, c]
+        # t2 = time.time()
+        
         video_features = self.get_model().mm_projector(video_features)
-        return video_features
+        
+        # t3 = time.time()
+        video_features = self.spatial_pruning(video_features, keep_ratio=0.25)
+        # t4 = time.time()
+        # video_features = self.diff_temporal_merging(video_features, tomerge_size=t-num_images)
+        video_features = self.sim_temporal_merging(video_features, tomerge_size=t-num_images)
+        # t5 = time.time()
+        # print(t5-t3)
+        
+        
+        
+  
+        
+     
+        
+        
+        return video_features[:,:, :, :]
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels, images
@@ -193,33 +385,8 @@ class LlavaMetaForCausalLM(ABC):
         video_idx = [idx for idx, vid in enumerate(images) if vid.ndim == 4]
         images_minibatch = torch.stack([images[idx] for idx in image_idx]) if len(image_idx) > 0 else []  # mini_b c h w
         videos_minibatch = torch.stack([images[idx] for idx in video_idx]) if len(video_idx) > 0 else []  # mini_b c t h w
-
-        tmp_image_features = [None] * (len(image_idx) + len(video_idx))
-        if getattr(images_minibatch, 'ndim', 0) == 4:  # batch consists of images, [mini_b, c, h, w]
-            if image_tower is not None:
-                image_features_minibatch = self.encode_images(images_minibatch)  # [mini_b, l, c]
-            else:
-                image_features_minibatch = torch.randn(1).to(self.device)  # dummy feature for video-only training under tuning
-            for i, pos in enumerate(image_idx):
-                tmp_image_features[pos] = image_features_minibatch[i]
-
-        if getattr(videos_minibatch, 'ndim', 0) == 5:  # batch consists of videos, [mini_b, c, t, h, w]
-            video_features_minibatch = self.encode_videos(videos_minibatch)  # fake list [mini_b, t, l, c]
-            for i, pos in enumerate(video_idx):
-                t = video_features_minibatch[i].shape[0]
-                tmp_image_features[pos] = [video_features_minibatch[i][j] for j in range(t)]
-
-        new_tmp = []
-        for image in tmp_image_features:
-            # print(len(new_tmp), len(image))
-            if isinstance(image, list):
-                t = len(image)
-                for i in range(t):
-                    new_tmp.append(image[i])
-                # print('add video')
-            else:
-                new_tmp.append(image)
-        image_features = new_tmp
+        
+        
         # print(len(image_features), *[i.shape for i in image_features])
         # print(len(image_features), image_features[0].shape)
         # ====================================================================================================
@@ -251,46 +418,81 @@ class LlavaMetaForCausalLM(ABC):
         new_input_embeds = []
         new_labels = []
         cur_image_idx = 0
-        for batch_idx, cur_input_ids in enumerate(input_ids):
-            num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
-            # print(num_images, cur_input_ids)
-            if num_images == 0:
+        
+        cur_input_ids = input_ids[0]
+        num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+        
+
+        image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
+        cur_input_ids_noim = []
+        cur_labels = labels[0]
+        cur_labels_noim = []
+        for i in range(len(image_token_indices) - 1):
+            cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
+            cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
+        split_sizes = [x.shape[0] for x in cur_labels_noim]
+        
+        cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
+        
+        cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
+        
+        ################# question-based compression ######################
+        
+        
+        tmp_image_features = [None] * (len(image_idx) + len(video_idx))
+        if getattr(images_minibatch, 'ndim', 0) == 4:  # batch consists of images, [mini_b, c, h, w]
+            if image_tower is not None:
+                image_features_minibatch = self.encode_images(images_minibatch)  # [mini_b, l, c]
+            else:
+                image_features_minibatch = torch.randn(1).to(self.device)  # dummy feature for video-only training under tuning
+            for i, pos in enumerate(image_idx):
+                tmp_image_features[pos] = image_features_minibatch[i]
+
+        if getattr(videos_minibatch, 'ndim', 0) == 5:  # batch consists of videos, [mini_b, c, t, h, w]
+            num_images = (input_ids[0] == IMAGE_TOKEN_INDEX).sum()
+            
+            video_features_minibatch = self.encode_videos(videos_minibatch, num_images,cur_input_embeds)  # fake list [mini_b, t, l, c]
+            # t1 = time.time()
+            # video_features_minibatch = self.pool_compr(video_features_minibatch,cur_input_embeds,K=0.5)
+            # t2 = time.time()
+            # print(t2-t1)
+            # print(f'video_features_minibatch: {video_features_minibatch.shape}') # [1, 8, 257, 4096]
+            for i, pos in enumerate(video_idx):
+                t = video_features_minibatch[i].shape[0]
+                tmp_image_features[pos] = [video_features_minibatch[i][j] for j in range(t)]
+
+        new_tmp = []
+        for image in tmp_image_features:
+            # print(len(new_tmp), len(image))
+            if isinstance(image, list):
+                t = len(image)
+                for i in range(t):
+                    new_tmp.append(image[i])
+                # print('add video')
+            else:
+                new_tmp.append(image)
+        image_features = new_tmp
+        # print(image_features.shape)
+        ###################################################################
+        
+        cur_new_input_embeds = []
+        cur_new_labels = []
+
+        for i in range(num_images + 1):
+            cur_new_input_embeds.append(cur_input_embeds_no_im[i])
+            cur_new_labels.append(cur_labels_noim[i])
+            if i < num_images:
+                # print(cur_image_idx)
                 cur_image_features = image_features[cur_image_idx]
-                cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
-                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
-                new_input_embeds.append(cur_input_embeds)
-                new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
-                continue
+                cur_new_input_embeds.append(cur_image_features)
+                cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
-            image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
-            cur_input_ids_noim = []
-            cur_labels = labels[batch_idx]
-            cur_labels_noim = []
-            for i in range(len(image_token_indices) - 1):
-                cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
-                cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
-            split_sizes = [x.shape[0] for x in cur_labels_noim]
-            cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
-            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
-            cur_new_input_embeds = []
-            cur_new_labels = []
+        cur_new_input_embeds = torch.cat(cur_new_input_embeds)  #change it to [2110,4096]   8*257+35+19
+        cur_new_labels = torch.cat(cur_new_labels)
 
-            for i in range(num_images + 1):
-                cur_new_input_embeds.append(cur_input_embeds_no_im[i])
-                cur_new_labels.append(cur_labels_noim[i])
-                if i < num_images:
-                    # print(cur_image_idx)
-                    cur_image_features = image_features[cur_image_idx]
-                    cur_image_idx += 1
-                    cur_new_input_embeds.append(cur_image_features)
-                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
-
-            cur_new_input_embeds = torch.cat(cur_new_input_embeds)
-            cur_new_labels = torch.cat(cur_new_labels)
-
-            new_input_embeds.append(cur_new_input_embeds)
-            new_labels.append(cur_new_labels)
+        new_input_embeds.append(cur_new_input_embeds)
+        new_labels.append(cur_new_labels)
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)

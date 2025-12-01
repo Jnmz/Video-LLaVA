@@ -1,5 +1,11 @@
 import math
 import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+import sys
+sys.path.append('.')
 import argparse
 import json
 
@@ -13,10 +19,19 @@ from videollava.model.builder import load_pretrained_model
 from videollava.model.language_model.llava_llama import LlavaLlamaForCausalLM
 from videollava.train.train import smart_tokenizer_and_embedding_resize
 import time
+import random
+import numpy as np
+
+def set_seed(seed: int):
+    """
+    ### Set random seeds
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 def split_list(lst, n):
     """Split a list into n (roughly) equal-sized chunks"""
@@ -47,7 +62,6 @@ def get_chunk(lst, n, k):
 #     parser.add_argument("--device", type=str, required=False, default='cuda:0')
 #     parser.add_argument('--model_base', help='', default=None, type=str, required=False)
 #     parser.add_argument("--model_max_length", type=int, required=False, default=2048)
-
 #     return parser.parse_args()
 
 def parse_args():
@@ -57,13 +71,13 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     # Define the command-line arguments
-    parser.add_argument('--model_path', default="/root/autodl-tmp/checkpoints/Video-LLaVA-7B") # adjust accordingly 
-    parser.add_argument('--cache_dir', default="/root/autodl-tmp/cache/cache_dir") # adjust accordingly 
-    parser.add_argument('--video_dir', default="videollava/eval/GPT_Zero_Shot_QA/MSVD_Zero_Shot_QA/videos",help='Directory containing video files.')
-    parser.add_argument('--gt_file_question', default="videollava/eval/GPT_Zero_Shot_QA/MSVD_Zero_Shot_QA/test_q.json" ,help='Path to the ground truth file containing question.')
-    parser.add_argument('--gt_file_answers', default="videollava/eval/GPT_Zero_Shot_QA/MSVD_Zero_Shot_QA/test_a.json",help='Path to the ground truth file containing answers.')
-    parser.add_argument('--output_dir', default="videollava/eval/GPT_Zero_Shot_QA/Video-LLaVA-7B",help='Directory to save the model results JSON.')
-    parser.add_argument('--output_name', default="spatial_0.5_full", help='Name of the file for storing results JSON.')
+    # parser.add_argument('--model_path', default="/data/zihuizhao/checkpoints/Video-LLaVA-7B") # adjust accordingly 
+    parser.add_argument('--cache_dir', default="/data/zihuizhao/cache/cache_dir") # adjust accordingly 
+    parser.add_argument('--video_dir', default="/data/zihuizhao/VQA_eval_datasets/MSRVTT_Zero_Shot_QA/videos/all",help='Directory containing video files.')
+    parser.add_argument('--gt_file_question', default="/data/zihuizhao/VQA_eval_datasets/MSRVTT_Zero_Shot_QA/test_q.json" ,help='Path to the ground truth file containing question.')
+    parser.add_argument('--gt_file_answers', default="/data/zihuizhao/VQA_eval_datasets/MSRVTT_Zero_Shot_QA/test_a.json",help='Path to the ground truth file containing answers.')
+    parser.add_argument('--output_dir', default="videollava/eval/GPT_Zero_Shot_QA/MSRVTT",help='Directory to save the model results JSON.')
+    parser.add_argument('--output_name', default="no_compr_20k", help='Name of the file for storing results JSON.')
     parser.add_argument("--num_chunks", type=int, default=1)
     parser.add_argument("--chunk_idx", type=int, default=0)
     parser.add_argument("--num_images", type=int, default=8)
@@ -157,6 +171,7 @@ def run_inference(args):
     gt_questions = get_chunk(gt_questions, args.num_chunks, args.chunk_idx)
     gt_answers = json.load(open(args.gt_file_answers, "r"))
     # gt_answers = get_chunk(gt_answers, args.num_chunks, args.chunk_idx)
+    # gt_questions = sorted(gt_questions, key=lambda x: x['video_name'])
 
     answers_file = os.path.join(args.output_dir, f"{args.output_name}.json")
     os.makedirs(args.output_dir, exist_ok=True)
@@ -174,8 +189,8 @@ def run_inference(args):
     # Iterate over each sample in the ground truth file
     index = 0
     time_count = 0
-    for sample in tqdm(gt_questions):
-        video_name = sample['video_name']
+    for sample in tqdm(gt_questions): 
+        video_name =  sample['video_name']
         question = sample['question']
         id = sample['question_id']
         answer = gt_answers[index]['answer']
@@ -200,6 +215,9 @@ def run_inference(args):
                 #     print(f"Error processing video file '{video_name}': {e}")
                 ans_file.write(json.dumps(sample_set) + "\n")
                 break
+            
+        if index >= 20000:
+            break
     
     
     print("##################")
@@ -213,5 +231,6 @@ def run_inference(args):
 
 
 if __name__ == "__main__":
+    set_seed(3407)
     args = parse_args()
     run_inference(args)
